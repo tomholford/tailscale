@@ -29,9 +29,10 @@ import (
 // values to modify the config before calling NewServer.
 // Once the NewServer is called, Config is no longer used.
 type Config struct {
-	nodes    []*Node
-	networks []*Network
-	pcapFile string
+	nodes        []*Node
+	networks     []*Network
+	pcapFile     string
+	blendReality bool
 }
 
 func (c *Config) SetPCAPFile(file string) {
@@ -40,6 +41,13 @@ func (c *Config) SetPCAPFile(file string) {
 
 func (c *Config) NumNodes() int {
 	return len(c.nodes)
+}
+
+// SetBlendReality sets whether to blend the real controlplane.tailscale.com and
+// DERP servers into the virtual network. This is mostly useful for interactive
+// testing when working on natlab.
+func (c *Config) SetBlendReality(v bool) {
+	c.blendReality = v
 }
 
 func (c *Config) FirstNetwork() *Network {
@@ -120,6 +128,7 @@ type TailscaledEnv struct {
 func (c *Config) AddNetwork(opts ...any) *Network {
 	num := len(c.networks)
 	n := &Network{
+		num: num + 1,
 		mac: MAC{0x52, 0xee, 0xee, 0xee, 0xee, byte(num) + 1}, // 52=TS then 0xee for 'etwork
 	}
 	c.networks = append(c.networks, n)
@@ -129,7 +138,11 @@ func (c *Config) AddNetwork(opts ...any) *Network {
 			if ip, err := netip.ParseAddr(o); err == nil {
 				n.wanIP = ip
 			} else if ip, err := netip.ParsePrefix(o); err == nil {
-				n.lanIP = ip
+				if ip.Addr().Is4() {
+					n.lanIP = ip
+				} else if ip.Addr().Is6() {
+					n.wanIP6 = ip
+				}
 			} else {
 				if n.err == nil {
 					n.err = fmt.Errorf("unknown string option %q", o)
@@ -207,8 +220,11 @@ func (n *Node) Network() *Network {
 
 // Network is the configuration of a network in the virtual network.
 type Network struct {
+	num     int // 1-based
 	mac     MAC // MAC address of the router/gateway
 	natType NAT
+
+	wanIP6 netip.Prefix // global unicast router in host bits; CIDR is /64 delegated to LAN
 
 	wanIP netip.Addr
 	lanIP netip.Prefix
@@ -270,13 +286,16 @@ func (s *Server) initFromConfig(c *Config) error {
 		if conf.err != nil {
 			return conf.err
 		}
-		if !conf.lanIP.IsValid() {
+		if !conf.lanIP.IsValid() && !conf.wanIP6.IsValid() {
 			conf.lanIP = netip.MustParsePrefix("192.168.0.0/24")
 		}
 		n := &network{
+			num:       conf.num,
 			s:         s,
 			mac:       conf.mac,
 			portmap:   conf.svcs.Contains(NATPMP), // TODO: expand network.portmap
+			wanIP6:    conf.wanIP6,
+			v6:        conf.wanIP6.IsValid(),
 			wanIP:     conf.wanIP,
 			lanIP:     conf.lanIP,
 			nodesByIP: map[netip.Addr]*node{},
@@ -284,10 +303,12 @@ func (s *Server) initFromConfig(c *Config) error {
 		}
 		netOfConf[conf] = n
 		s.networks.Add(n)
-		if _, ok := s.networkByWAN[conf.wanIP]; ok {
-			return fmt.Errorf("two networks have the same WAN IP %v; Anycast not (yet?) supported", conf.wanIP)
+		if conf.wanIP.IsValid() {
+			if _, ok := s.networkByWAN[conf.wanIP]; ok {
+				return fmt.Errorf("two networks have the same WAN IP %v; Anycast not (yet?) supported", conf.wanIP)
+			}
+			s.networkByWAN[conf.wanIP] = n
 		}
-		s.networkByWAN[conf.wanIP] = n
 		n.lanInterfaceID = must.Get(s.pcapWriter.AddInterface(pcapgo.NgInterface{
 			Name:     fmt.Sprintf("network%d-lan", i+1),
 			LinkType: layers.LinkTypeIPv4,
@@ -321,10 +342,12 @@ func (s *Server) initFromConfig(c *Config) error {
 		// Allocate a lanIP for the node. Use the network's CIDR and use final
 		// octet 101 (for first node), 102, etc. The node number comes from the
 		// last octent of the MAC address (0-based)
-		ip4 := n.net.lanIP.Addr().As4()
-		ip4[3] = 100 + n.mac[5]
-		n.lanIP = netip.AddrFrom4(ip4)
-		n.net.nodesByIP[n.lanIP] = n
+		if n.net.lanIP.IsValid() {
+			ip4 := n.net.lanIP.Addr().As4()
+			ip4[3] = 100 + n.mac[5]
+			n.lanIP = netip.AddrFrom4(ip4)
+			n.net.nodesByIP[n.lanIP] = n
+		}
 	}
 
 	// Now that nodes are populated, set up NAT:

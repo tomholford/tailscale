@@ -102,6 +102,11 @@ func easy(c *vnet.Config) *vnet.Node {
 		fmt.Sprintf("192.168.%d.1/24", n), vnet.EasyNAT))
 }
 
+func easy6(c *vnet.Config) *vnet.Node {
+	n := c.NumNodes() + 1
+	return c.AddNode(c.AddNetwork(fmt.Sprintf("2000:%d::1/64", n))) // public IPv6 prefix
+}
+
 // easy + host firewall
 func easyFW(c *vnet.Config) *vnet.Node {
 	n := c.NumNodes() + 1
@@ -442,6 +447,13 @@ func (nt *natTest) want(r pingRoute) {
 func TestEasyEasy(t *testing.T) {
 	nt := newNatTest(t)
 	nt.runTest(easy, easy)
+	nt.want(routeDirect)
+}
+
+func TestEasyEasyIPv6(t *testing.T) {
+	t.Skip("TODO(bradfitz): finish IPv6; skipping for now")
+	nt := newNatTest(t)
+	nt.runTest(easy6, easy6)
 	nt.want(routeDirect)
 }
 

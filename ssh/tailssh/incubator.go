@@ -670,14 +670,26 @@ func (ss *sshSession) launchProcess() error {
 
 	cmd := ss.cmd
 	homeDir := ss.conn.localUser.HomeDir
-	if _, err := os.Stat(homeDir); err == nil {
-		cmd.Dir = homeDir
-	} else if os.IsNotExist(err) {
-		// If the home directory doesn't exist, we can't chdir to it.
-		// Instead, we'll chdir to the root directory.
+	// We prefer to execute the child process in the connecting user's home
+	// directory. We need to be able to chdir to that directory in order to do
+	// so. How to check this? We don't want to chdir the parent tailscaled
+	// process, because that could have unexpected side-effects depending on
+	// what assumptions tailscaled makes about its working directory.
+	//
+	// Instead, we assume that if we're able to read the directory, we can
+	// chdir there, and conversely if we can't read the directory, we can't
+	// chdir there.
+	//
+	// To test this, we attempt to read some of the contents of the directory.
+	// If this succeeds, we assume that we'll be able to chdir to the directory,
+	// otherwise we assume that we can't.
+	f, err := os.Open(homeDir)
+	if err != nil {
 		cmd.Dir = "/"
+	} else if _, err := f.ReadDir(1); err == nil || err == io.EOF {
+		cmd.Dir = homeDir
 	} else {
-		return err
+		cmd.Dir = "/"
 	}
 	cmd.Env = envForUser(ss.conn.localUser)
 	for _, kv := range ss.Environ() {

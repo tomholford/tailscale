@@ -31,13 +31,16 @@ import (
 // We parse the data and send everything for the STDOUT/STDERR streams to the configured tsrecorder as an asciinema recording with the provided header.
 // https://github.com/kubernetes/enhancements/tree/master/keps/sig-api-machinery/4006-transition-spdy-to-websockets#proposal-new-remotecommand-sub-protocol-version---v5channelk8sio
 func New(c net.Conn, rec *tsrecorder.Client, ch sessionrecording.CastHeader, hasTerm bool, log *zap.SugaredLogger) net.Conn {
+	chn := make(chan struct{})
+	if !hasTerm {
+		close(chn)
+	}
 	return &conn{
 		Conn:               c,
 		rec:                rec,
 		ch:                 ch,
-		hasTerm:            hasTerm,
 		log:                log,
-		initialTermSizeSet: make(chan string, 1),
+		initialTermSizeSet: chn,
 	}
 }
 
@@ -69,14 +72,11 @@ type conn struct {
 	// ch is asciinema CastHeader for the current session.
 	// https://docs.asciinema.org/manual/asciicast/v2/#header
 	ch sessionrecording.CastHeader
-	// writeCastHeaderOnce is used to ensure CastHeader gets sent to tsrecorder once.
-	writeCastHeaderOnce sync.Once
-	hasTerm             bool // whether the session has TTY attached
 	// initialTermSizeSet channel gets sent a value once, when the Read has
 	// received a resize message and set the initial terminal size. It must
 	// be set to a buffered channel to prevent Reads being blocked on the
 	// first STDOUT/STDERR write reading from the channel.
-	initialTermSizeSet chan string
+	initialTermSizeSet chan struct{}
 	// sendInitialTermSizeSetOnce is used to ensure that a value is sent to
 	// initialTermSizeSet channel only once, when the initial resize message
 	// is received.
@@ -189,8 +189,14 @@ func (c *conn) Read(b []byte) (int, error) {
 			var isInitialResize bool
 			c.sendInitialTermSizeSetOnce.Do(func() {
 				isInitialResize = true
-				c.initialTermSizeSet <- "set" // unblock sending of CastHeader
+				err = c.rec.WriteCastHeader(c.ch)
+				if err == nil {
+					close(c.initialTermSizeSet) // unblock sending of CastHeader
+				}
 			})
+			if err != nil {
+				return 0, fmt.Errorf("error writing CastHeader: %w", err)
+			}
 			if !isInitialResize {
 				if err := c.rec.WriteResize(c.ch.Height, c.ch.Width); err != nil {
 					return 0, fmt.Errorf("error writing resize message: %w", err)
@@ -252,22 +258,7 @@ func (c *conn) Write(b []byte) (int, error) {
 
 	if len(writeMsg.payload) != 0 && writeMsg.isFinalized {
 		if writeMsg.streamID.Load() == remotecommand.StreamStdOut || writeMsg.streamID.Load() == remotecommand.StreamStdErr {
-			var err error
-			c.writeCastHeaderOnce.Do(func() {
-				// If this is a session with a terminal attached,
-				// we must wait for the terminal width and
-				// height to be parsed from a resize message
-				// before sending CastHeader, else tsrecorder
-				// will not be able to play this recording.
-				if c.hasTerm {
-					c.log.Debug("waiting for terminal size to be set before starting to send recorded data")
-					<-c.initialTermSizeSet
-				}
-				err = c.rec.WriteCastHeader(c.ch)
-			})
-			if err != nil {
-				return 0, fmt.Errorf("error writing CastHeader: %w", err)
-			}
+			<-c.initialTermSizeSet
 			if err := c.rec.WriteOutput(writeMsg.payload); err != nil {
 				return 0, fmt.Errorf("error writing message to recorder: %v", err)
 			}

@@ -36,6 +36,7 @@ import (
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
+	"tailscale.com/wgengine/netstack/gro"
 	"tailscale.com/wgengine/wgcfg"
 )
 
@@ -73,6 +74,12 @@ var parsedPacketPool = sync.Pool{New: func() any { return new(packet.Parsed) }}
 // FilterFunc is a packet-filtering function with access to the Wrapper device.
 // It must not hold onto the packet struct, as its backing storage will be reused.
 type FilterFunc func(*packet.Parsed, *Wrapper) filter.Response
+
+// GROFilterFunc is a FilterFunc extended with a *gro.GRO, enabling increased
+// throughput where GRO is supported by a packet.Parsed interceptor, e.g.
+// netstack/gVisor. *gro.GRO may be nil if GRO is unsupported or immediate
+// packet delivery is desired.
+type GROFilterFunc func(*packet.Parsed, *Wrapper, *gro.GRO) filter.Response
 
 // Wrapper augments a tun.Device with packet filtering and injection.
 //
@@ -157,15 +164,16 @@ type Wrapper struct {
 	// Can be nil, which means drop all packets.
 	jailedFilter atomic.Pointer[filter.Filter]
 
+	// GetGRO returns a new instance of a *gro.GRO, which may be used to
+	// coalesce packets through a GROFilterFunc. GetGRO may be nil if GRO is
+	// unsupported at runtime.
+	GetGRO func() *gro.GRO
+
 	// PreFilterPacketInboundFromWireGuard is the inbound filter function that runs before the main filter
 	// and therefore sees the packets that may be later dropped by it.
 	PreFilterPacketInboundFromWireGuard FilterFunc
 	// PostFilterPacketInboundFromWireGuard is the inbound filter function that runs after the main filter.
-	PostFilterPacketInboundFromWireGuard FilterFunc
-	// EndPacketVectorInboundFromWireGuardFlush is a function that runs after all packets in a given vector
-	// have been handled by all filters. Filters may queue packets for the purposes of GRO, requiring an
-	// explicit flush.
-	EndPacketVectorInboundFromWireGuardFlush func()
+	PostFilterPacketInboundFromWireGuard GROFilterFunc
 	// PreFilterPacketOutboundToWireGuardNetstackIntercept is a filter function that runs before the main filter
 	// for packets from the local system. This filter is populated by netstack to hook
 	// packets that should be handled by netstack. If set, this filter runs before
@@ -1061,7 +1069,7 @@ func (t *Wrapper) injectedRead(res tunInjectedRead, outBuffs [][]byte, sizes []i
 	return n, err
 }
 
-func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook capture.Callback, pc *peerConfigTable) filter.Response {
+func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook capture.Callback, pc *peerConfigTable, gro *gro.GRO) filter.Response {
 	if captHook != nil {
 		captHook(capture.FromPeer, t.now(), p.Buffer(), p.CaptureMeta)
 	}
@@ -1154,7 +1162,7 @@ func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook ca
 	}
 
 	if t.PostFilterPacketInboundFromWireGuard != nil {
-		if res := t.PostFilterPacketInboundFromWireGuard(p, t); res.IsDrop() {
+		if res := t.PostFilterPacketInboundFromWireGuard(p, t, gro); res.IsDrop() {
 			return res
 		}
 	}
@@ -1162,8 +1170,10 @@ func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook ca
 	return filter.Accept
 }
 
-// Write accepts incoming packets. The packets begins at buffs[:][offset:],
-// like wireguard-go/tun.Device.Write.
+// Write accepts incoming packets. The packets begin at buffs[:][offset:],
+// like wireguard-go/tun.Device.Write. Write is called per-peer via
+// wireguard-go/device.Peer.RoutineSequentialReceiver, so it MUST be
+// thread-safe.
 func (t *Wrapper) Write(buffs [][]byte, offset int) (int, error) {
 	metricPacketIn.Add(int64(len(buffs)))
 	i := 0
@@ -1171,11 +1181,15 @@ func (t *Wrapper) Write(buffs [][]byte, offset int) (int, error) {
 	defer parsedPacketPool.Put(p)
 	captHook := t.captureHook.Load()
 	pc := t.peerConfig.Load()
+	var buffsGRO *gro.GRO
+	if t.GetGRO != nil {
+		buffsGRO = t.GetGRO()
+	}
 	for _, buff := range buffs {
 		p.Decode(buff[offset:])
 		pc.dnat(p)
 		if !t.disableFilter {
-			if t.filterPacketInboundFromWireGuard(p, captHook, pc) != filter.Accept {
+			if t.filterPacketInboundFromWireGuard(p, captHook, pc, buffsGRO) != filter.Accept {
 				metricPacketInDrop.Add(1)
 			} else {
 				buffs[i] = buff
@@ -1183,8 +1197,8 @@ func (t *Wrapper) Write(buffs [][]byte, offset int) (int, error) {
 			}
 		}
 	}
-	if t.EndPacketVectorInboundFromWireGuardFlush != nil {
-		t.EndPacketVectorInboundFromWireGuardFlush()
+	if buffsGRO != nil {
+		buffsGRO.Flush()
 	}
 	if t.disableFilter {
 		i = len(buffs)

@@ -54,6 +54,7 @@ import (
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/magicsock"
 	"tailscale.com/wgengine/netlog"
+	"tailscale.com/wgengine/netstack/gro"
 	"tailscale.com/wgengine/router"
 	"tailscale.com/wgengine/wgcfg"
 	"tailscale.com/wgengine/wgint"
@@ -519,7 +520,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 }
 
 // echoRespondToAll is an inbound post-filter responding to all echo requests.
-func echoRespondToAll(p *packet.Parsed, t *tstun.Wrapper) filter.Response {
+func echoRespondToAll(p *packet.Parsed, t *tstun.Wrapper, _ *gro.GRO) filter.Response {
 	if p.IsEchoRequest() {
 		header := p.ICMP4Header()
 		header.ToResponse()

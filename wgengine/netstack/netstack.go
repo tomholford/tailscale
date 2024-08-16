@@ -54,6 +54,7 @@ import (
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/magicsock"
+	"tailscale.com/wgengine/netstack/gro"
 )
 
 const debugPackets = false
@@ -324,15 +325,17 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 	if err != nil {
 		return nil, err
 	}
-	var linkEP *linkEndpoint
+	var (
+		gro              groSupport
+		supportedGSOKind stack.SupportedGSO
+	)
 	if runtime.GOOS == "linux" {
-		// TODO(jwhited): add Windows GSO support https://github.com/tailscale/corp/issues/21874
-		// TODO(jwhited): exercise enableGRO in relation to https://github.com/tailscale/corp/issues/22353
-		linkEP = newLinkEndpoint(512, uint32(tstun.DefaultTUNMTU()), "", disableGRO)
-		linkEP.SupportedGSOKind = stack.HostGSOSupported
-	} else {
-		linkEP = newLinkEndpoint(512, uint32(tstun.DefaultTUNMTU()), "", disableGRO)
+		// TODO(jwhited): add Windows support https://github.com/tailscale/corp/issues/21874
+		gro = enableGRO
+		supportedGSOKind = stack.HostGSOSupported
 	}
+	linkEP := newLinkEndpoint(512, uint32(tstun.DefaultTUNMTU()), "", gro)
+	linkEP.SupportedGSOKind = supportedGSOKind
 	if tcpipProblem := ipstack.CreateNIC(nicID, linkEP); tcpipProblem != nil {
 		return nil, fmt.Errorf("could not create netstack NIC: %v", tcpipProblem)
 	}
@@ -379,8 +382,10 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 	}
 	ns.ctx, ns.ctxCancel = context.WithCancel(context.Background())
 	ns.atomicIsLocalIPFunc.Store(ipset.FalseContainsIPFunc())
+	if gro {
+		ns.tundev.GetGRO = linkEP.getGRO
+	}
 	ns.tundev.PostFilterPacketInboundFromWireGuard = ns.injectInbound
-	ns.tundev.EndPacketVectorInboundFromWireGuardFlush = linkEP.flushGRO
 	ns.tundev.PreFilterPacketOutboundToWireGuardNetstackIntercept = ns.handleLocalPackets
 	stacksForMetrics.Store(ns, struct{}{})
 	return ns, nil
@@ -1039,7 +1044,7 @@ func (ns *Impl) userPing(dstIP netip.Addr, pingResPkt []byte, direction userPing
 // continue normally (typically being delivered to the host networking stack),
 // whereas returning filter.DropSilently is done when netstack intercepts the
 // packet and no further processing towards to host should be done.
-func (ns *Impl) injectInbound(p *packet.Parsed, t *tstun.Wrapper) filter.Response {
+func (ns *Impl) injectInbound(p *packet.Parsed, t *tstun.Wrapper, gro *gro.GRO) filter.Response {
 	if ns.ctx.Err() != nil {
 		return filter.DropSilently
 	}
@@ -1072,7 +1077,11 @@ func (ns *Impl) injectInbound(p *packet.Parsed, t *tstun.Wrapper) filter.Respons
 	if debugPackets {
 		ns.logf("[v2] packet in (from %v): % x", p.Src, p.Buffer())
 	}
-	ns.linkEP.enqueueGRO(p)
+	if gro != nil {
+		gro.Enqueue(p)
+	} else {
+		ns.linkEP.injectInbound(p)
+	}
 
 	// We've now delivered this to netstack, so we're done.
 	// Instead of returning a filter.Accept here (which would also
